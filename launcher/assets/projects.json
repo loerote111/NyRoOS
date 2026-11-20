@@ -1,0 +1,14 @@
+{
+  "projects": [
+    {
+      "name": "Documentação Android",
+      "type": "url",
+      "url": "https://developer.android.com/"
+    },
+    {
+      "name": "Arquivos",
+      "type": "app",
+      "package": "com.android.documentsui"
+    }
+  ]
+}

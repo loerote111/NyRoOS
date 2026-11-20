@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="com.nyroos.core">
+        <permission name="android.permission.RECOVERY" />
+        <permission name="android.permission.REBOOT" />
+    </privapp-permissions>
+</permissions>
