@@ -1,10 +1,10 @@
 package os.nyro.launcher;
 
 import static os.nyro.launcher.Visuals.*;
+import static os.nyro.launcher.LauncherPreferences.Option.*;
 
 import android.app.Activity;
 import android.app.ActivityManager;
-import android.app.AlertDialog;
 import android.app.SearchManager;
 import android.content.ComponentName;
 import android.content.Intent;
@@ -55,8 +55,6 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.text.Normalizer;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -69,14 +67,14 @@ import java.util.concurrent.Executors;
 public final class HomeActivity extends Activity {
     private static final String TAG = "NyRoLauncher";
     private static final String GOOGLE = "com.google.android.googlequicksearchbox";
-    private static final String[] FAVORITES = {GOOGLE, "com.android.camera2", "com.android.gallery3d",
+    private static final String[] FAVORITE_APPS = {GOOGLE, "com.android.camera2", "com.android.gallery3d",
             "com.android.documentsui"};
-    private static final String[] DOCK = {"com.android.dialer", "com.android.chrome", "com.android.vending",
-            "com.android.settings"};
+    private static final String[] DOCK_APPS = {"com.android.dialer", "com.android.chrome", "com.android.vending",
+            "os.nyro.launcher"};
     private static final Pattern ACCENTS = Pattern.compile("\\p{M}+");
     private static final DateTimeFormatter CLOCK_24 = DateTimeFormatter.ofPattern("HH:mm", DeviceMetrics.PT_BR);
     private static final DateTimeFormatter CLOCK_12 = DateTimeFormatter.ofPattern("h:mm", DeviceMetrics.PT_BR);
-    private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("EEEE, d 'de' MMMM", DeviceMetrics.PT_BR);
+    private static final DateTimeFormatter DATE_LABEL_FORMAT = DateTimeFormatter.ofPattern("EEEE, d 'de' MMMM", DeviceMetrics.PT_BR);
     private static final int CHOOSE_PROJECTS = 20;
     private static final int UNINSTALL_APP = 21;
     private enum Page { HOME, HUB, DRAWER }
@@ -111,10 +109,18 @@ public final class HomeActivity extends Activity {
     };
 
     private SharedPreferences preferences;
+    private View homePage, drawerPage;
+    private boolean appearanceDirty, metricsForVisit;
+    private final SharedPreferences.OnSharedPreferenceChangeListener preferenceChanges = (prefs, key) -> {
+        if (LauncherPreferences.HIDDEN.equals(key)) {
+            if (drawerPage != null) filterDrawer();
+        } else if (key != null && (key.startsWith("home.") || key.startsWith("hub."))) {
+            appearanceDirty = true;
+        }
+    };
     private LauncherApps launcher;
     private LauncherIcons icons;
     private int appsGeneration;
-    private View homePage, drawerPage;
     private Visuals.Wallpaper wallpaper;
     private FrameLayout content;
     private Page page = Page.HOME;
@@ -134,7 +140,8 @@ public final class HomeActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        preferences = getSharedPreferences("launcher", MODE_PRIVATE);
+        preferences = LauncherPreferences.get(this);
+        preferences.registerOnSharedPreferenceChangeListener(preferenceChanges);
         launcher = getSystemService(LauncherApps.class);
         icons = new LauncherIcons(handler, d(48));
         launcher.registerCallback(appChanges, handler);
@@ -161,7 +168,13 @@ public final class HomeActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
-        if (page == Page.HUB) reloadProjects(false);
+        if (appearanceDirty) {
+            appearanceDirty = false;
+            homePage = null;
+            if (page != Page.DRAWER) show(page, false);
+        } else if (page == Page.HUB && projectList != null) {
+            reloadProjects(false);
+        }
         handler.removeCallbacks(tick);
         tick.run();
     }
@@ -172,6 +185,7 @@ public final class HomeActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        preferences.unregisterOnSharedPreferenceChangeListener(preferenceChanges);
         launcher.unregisterCallback(appChanges);
         appWorker.shutdownNow();
         icons.close();
@@ -228,6 +242,7 @@ public final class HomeActivity extends Activity {
         Page previous = page;
         hideKeyboard();
         page = next;
+        if (page != Page.HUB) metricsForVisit = false;
         projectsGeneration++;
         if (content.getChildCount() != 0) content.getChildAt(0).animate().cancel();
         content.removeAllViews();
@@ -278,45 +293,64 @@ public final class HomeActivity extends Activity {
         header.addView(brand);
         header.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
 
-        LinearLayout batteryPill = row();
-        batteryPill.setPadding(d(10), 0, d(12), 0);
-        batteryPill.setBackground(pressable(this, 0x9e262034, 17, 0x545d4a79));
-        batteryPill.addView(glyph("battery", ACCENT, 18), size(24, 38));
-        battery = label("—", 13, TEXT, "sans-serif-medium");
-        battery.setPadding(d(5), 0, 0, 0);
-        batteryPill.addView(battery, size(-2, 38));
-        batteryPill.setContentDescription("Configurações da bateria");
-        batteryPill.setOnClickListener(view -> open(new Intent(Intent.ACTION_POWER_USAGE_SUMMARY)));
-        header.addView(batteryPill);
+        header.addView(settingsButton(), size(48, 43));
+        battery = null;
+        if (BATTERY.enabled(preferences)) {
+            LinearLayout batteryPill = row();
+            batteryPill.setPadding(d(9), 0, d(11), 0);
+            batteryPill.setBackground(pressable(this, 0x9e262034, 17, 0x545d4a79));
+            batteryPill.addView(glyph("battery", ACCENT, 18), size(23, 38));
+            battery = label("—", 13, TEXT, "sans-serif-medium");
+            battery.setPadding(d(4), 0, 0, 0);
+            batteryPill.addView(battery, size(-2, 38));
+            batteryPill.setContentDescription("Configurações da bateria");
+            batteryPill.setOnClickListener(view -> open(new Intent(Intent.ACTION_POWER_USAGE_SUMMARY)));
+            var badge = size(-2, 38);
+            badge.leftMargin = d(7);
+            header.addView(batteryPill, badge);
+        }
         layout.addView(header, size(-1, 43));
-        gap(layout, 42);
 
-        greeting = label("", 22, ACCENT, "sans-serif-medium");
-        layout.addView(greeting, size(-1, 29));
-        clock = label("", 78, TEXT, "sans-serif-light");
-        clock.setLetterSpacing(-.062f);
-        clock.setIncludeFontPadding(false);
-        layout.addView(clock, size(-1, 93));
-        date = label("", 16, MUTED, "sans-serif");
-        layout.addView(date, size(-1, 27));
-        gap(layout, 24);
-        layout.addView(homeSearch(), size(-1, 58));
+        greeting = clock = date = null;
+        if (GREETING.enabled(preferences) || CLOCK.enabled(preferences) || DATE.enabled(preferences)
+                || SEARCH.enabled(preferences)) gap(layout, 42);
+        if (GREETING.enabled(preferences)) {
+            greeting = label("", 22, ACCENT, "sans-serif-medium");
+            layout.addView(greeting, size(-1, 29));
+        }
+        if (CLOCK.enabled(preferences)) {
+            clock = label("", 78, TEXT, "sans-serif-light");
+            clock.setLetterSpacing(-.062f);
+            clock.setIncludeFontPadding(false);
+            layout.addView(clock, size(-1, 93));
+        }
+        if (DATE.enabled(preferences)) {
+            date = label("", 16, MUTED, "sans-serif");
+            layout.addView(date, size(-1, 27));
+        }
+        if (SEARCH.enabled(preferences)) {
+            if (greeting != null || clock != null || date != null) gap(layout, 24);
+            layout.addView(homeSearch(), size(-1, 58));
+        }
         layout.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1));
 
         LinearLayout favoriteHeader = row();
-        TextView favorites = label("Favoritos", 19, TEXT, "sans-serif-medium");
-        favoriteHeader.addView(favorites, new LinearLayout.LayoutParams(0, d(44), 1));
-        LinearLayout drawerButton = pill("grid", "Todos os apps", () -> show(Page.DRAWER, true));
-        favoriteHeader.addView(drawerButton, size(-2, 38));
+        boolean showFavorites = FAVORITES.enabled(preferences);
+        View leading = showFavorites ? label("Favoritos", 19, TEXT, "sans-serif-medium") : new View(this);
+        favoriteHeader.addView(leading, new LinearLayout.LayoutParams(0, d(44), 1));
+        favoriteHeader.addView(pill("grid", "Todos os apps", () -> show(Page.DRAWER, true)), size(-2, 43));
         layout.addView(favoriteHeader);
-        gap(layout, 7);
-        layout.addView(slots("favorite", FAVORITES, false), size(-1, 102));
-        gap(layout, 13);
-
-        LinearLayout dock = slots("dock", DOCK, true);
-        dock.setPadding(d(8), d(1), d(8), d(1));
-        dock.setBackground(surface(this, 0xe8221e30, 30, 0x665e4e78));
-        layout.addView(dock, size(-1, 83));
+        if (showFavorites) {
+            gap(layout, 7);
+            layout.addView(slots("favorite", FAVORITE_APPS, false), size(-1, 102));
+        }
+        if (DOCK.enabled(preferences)) {
+            gap(layout, 13);
+            LinearLayout dock = slots("dock", DOCK_APPS, true);
+            dock.setPadding(d(8), d(1), d(8), d(1));
+            dock.setBackground(surface(this, 0xe8221e30, 30, 0x665e4e78));
+            layout.addView(dock, size(-1, 83));
+        }
         updateHeader();
         return layout;
     }
@@ -358,15 +392,36 @@ public final class HomeActivity extends Activity {
     }
 
     private void updateHeader() {
-        if (clock == null || page != Page.HOME) return;
-        LocalDateTime now = LocalDateTime.now();
-        int hour = now.getHour();
-        setTextIfChanged(greeting, hour < 12 ? "Bom dia" : hour < 18 ? "Boa tarde" : "Boa noite");
-        setTextIfChanged(clock, now.format(DateFormat.is24HourFormat(this) ? CLOCK_24 : CLOCK_12));
-        String today = now.format(DATE);
-        setTextIfChanged(date, Character.toUpperCase(today.charAt(0)) + today.substring(1));
-        int percent = getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
-        setTextIfChanged(battery, percent >= 0 && percent <= 100 ? percent + "%" : "—");
+        if (page != Page.HOME) return;
+        if (greeting != null || clock != null || date != null) {
+            LocalDateTime now = LocalDateTime.now();
+            if (greeting != null) {
+                int hour = now.getHour();
+                setTextIfChanged(greeting, hour < 12 ? "Bom dia" : hour < 18 ? "Boa tarde" : "Boa noite");
+            }
+            if (clock != null) setTextIfChanged(clock, now.format(DateFormat.is24HourFormat(this) ? CLOCK_24 : CLOCK_12));
+            if (date != null) {
+                String today = now.format(DATE_LABEL_FORMAT);
+                setTextIfChanged(date, Character.toUpperCase(today.charAt(0)) + today.substring(1));
+            }
+        }
+        if (battery != null) {
+            int percent = getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+            setTextIfChanged(battery, percent >= 0 && percent <= 100 ? percent + "%" : "—");
+        }
+    }
+
+    private View settingsButton() {
+        View action = glyph("settings", ACCENT, 22);
+        action.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+        action.setContentDescription("Configurações NyRoOS");
+        action.setBackground(pressable(this, 0xff262037, 15, LINE));
+        action.setOnClickListener(view -> openSettings());
+        return action;
+    }
+
+    private void openSettings() {
+        open(new Intent(this, NyRoSettingsActivity.class));
     }
 
     private LinearLayout slots(String prefix, String[] defaults, boolean dock) {
@@ -375,7 +430,15 @@ public final class HomeActivity extends Activity {
             int slot = index;
             LauncherActivityInfo item = slotApp(prefix + index, defaults[index]);
             View tile = appTile(item, dock ? "dock" : "favorite", () -> launch(item),
-                    () -> slotMenu(prefix, slot, item));
+                    () -> {
+                        if (item == null) {
+                            slotMenu(prefix, slot);
+                        } else {
+                            var change = new NyRoSheet.Action(dock ? "Trocar atalho" : "Trocar favorito", "grid",
+                                    () -> slotMenu(prefix, slot));
+                            appMenu(item, change);
+                        }
+                    });
             LinearLayout.LayoutParams cell = new LinearLayout.LayoutParams(0, -1, 1);
             if (!dock && index > 0) cell.leftMargin = d(8);
             line.addView(tile, cell);
@@ -396,7 +459,8 @@ public final class HomeActivity extends Activity {
         View icon = item == null ? glyph("grid", MUTED, 24) : appIcon(item);
         box.addView(icon, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         tile.addView(box, size(tileSize, tileSize));
-        String title = item == null ? "Selecionar" : appLabel(item);
+        String title = item == null ? "Selecionar"
+                : dock && getPackageName().equals(item.getComponentName().getPackageName()) ? "Configurações" : appLabel(item);
         TextView text = label(title, dock ? 10.5f : 11.5f, dock ? MUTED : TEXT, "sans-serif-medium");
         text.setGravity(Gravity.CENTER);
         text.setMaxLines(1);
@@ -428,62 +492,76 @@ public final class HomeActivity extends Activity {
         body.addView(title, size(-1, 54));
         gap(body, 12);
 
-        LinearLayout system = row();
-        system.setPadding(d(15), 0, d(10), 0);
-        system.setBackground(pressable(this, 0xff211c30, 25, 0xff42355a));
-        system.addView(image(getDrawable(R.drawable.nyro_icon)), size(51, 65));
-        LinearLayout version = column(11, 0, 0, 0);
-        version.setGravity(Gravity.CENTER_VERTICAL);
-        String identity = Build.DISPLAY.startsWith("NyRoOS ") ? Build.DISPLAY : "NyRoOS";
-        version.addView(label(identity, 17, TEXT, "sans-serif-medium"), size(-1, 27));
-        version.addView(label("Android " + Build.VERSION.RELEASE + "  ·  " + Build.SUPPORTED_ABIS[0],
-                12, MUTED, "sans-serif"), size(-1, 22));
-        system.addView(version, new LinearLayout.LayoutParams(0, -1, 1));
-        system.addView(glyph("right", ACCENT, 20), size(38, 62));
-        system.setContentDescription(identity + ", sobre o sistema");
-        system.setOnClickListener(view -> open(new Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)));
-        body.addView(system, size(-1, 86));
-        gap(body, 14);
+        if (DEVICE.enabled(preferences)) {
+            LinearLayout system = row();
+            system.setPadding(d(15), 0, d(10), 0);
+            system.setBackground(pressable(this, 0xff211c30, 25, 0xff42355a));
+            system.addView(image(getDrawable(R.drawable.nyro_icon)), size(51, 65));
+            LinearLayout version = column(11, 0, 0, 0);
+            version.setGravity(Gravity.CENTER_VERTICAL);
+            String identity = Build.DISPLAY.startsWith("NyRoOS ") ? Build.DISPLAY : "NyRoOS";
+            version.addView(label(identity, 17, TEXT, "sans-serif-medium"), size(-1, 27));
+            version.addView(label("Android " + Build.VERSION.RELEASE + "  ·  " + Build.SUPPORTED_ABIS[0],
+                    12, MUTED, "sans-serif"), size(-1, 22));
+            system.addView(version, new LinearLayout.LayoutParams(0, -1, 1));
+            system.addView(glyph("right", ACCENT, 20), size(38, 62));
+            system.setContentDescription(identity + ", sobre o sistema");
+            system.setOnClickListener(view -> open(new Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)));
+            body.addView(system, size(-1, 86));
+            gap(body, 14);
 
-        LinearLayout first = row();
-        LinearLayout ram = metric("RAM", "chip");
-        ramValue = metricValue(ram, "—");
-        ramDetail = metricDetail(ram, "");
-        ramBar = meter(ram);
-        metricCell(first, ram, false, () -> open(new Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)));
-        LinearLayout cpu = metric("CPU", "code");
-        cpuValue = metricValue(cpu, "—");
-        metricDetail(cpu, Runtime.getRuntime().availableProcessors() + " núcleos disponíveis");
-        metricCell(first, cpu, true, this::updateMetrics);
-        body.addView(first, size(-1, 119));
-        gap(body, 10);
+        }
 
-        LinearLayout second = row();
-        LinearLayout storage = metric("Armazenamento", "disk");
-        storageValue = metricValue(storage, "—");
-        storageDetail = metricDetail(storage, "");
-        storageBar = meter(storage);
-        metricCell(second, storage, false, () -> open(new Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)));
-        LinearLayout ip = metric("IP local", "network");
-        ipValue = metricValue(ip, "—");
-        ipValue.setTextSize(20);
-        metricDetail(ip, "Rede ativa");
-        metricCell(second, ip, true, () -> open(new Intent(Settings.ACTION_WIRELESS_SETTINGS)));
-        body.addView(second, size(-1, 119));
+        ramValue = null;
+        if (METRICS.enabled(preferences) || metricsForVisit) {
+            LinearLayout first = row();
+            LinearLayout ram = metric("RAM", "chip");
+            ramValue = metricValue(ram, "—");
+            ramDetail = metricDetail(ram, "");
+            ramBar = meter(ram);
+            metricCell(first, ram, false, () -> open(new Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)));
+            LinearLayout cpu = metric("CPU", "code");
+            cpuValue = metricValue(cpu, "—");
+            metricDetail(cpu, Runtime.getRuntime().availableProcessors() + " núcleos disponíveis");
+            metricCell(first, cpu, true, this::updateMetrics);
+            body.addView(first, size(-1, 119));
+            gap(body, 10);
 
-        gap(body, 17);
-        LinearLayout projects = row();
-        projects.addView(label("Projetos", 21, TEXT, "sans-serif-medium"),
-                new LinearLayout.LayoutParams(0, d(44), 1));
-        projects.addView(pill("link", "Conectar JSON", this::chooseProjects), size(-2, 37));
-        body.addView(projects);
-        projectSource = label("", 12, MUTED, "sans-serif");
-        body.addView(projectSource, size(-1, -2));
-        gap(body, 10);
-        projectList = column(0, 0, 0, 0);
-        body.addView(projectList, size(-1, -2));
+            LinearLayout second = row();
+            LinearLayout storage = metric("Armazenamento", "disk");
+            storageValue = metricValue(storage, "—");
+            storageDetail = metricDetail(storage, "");
+            storageBar = meter(storage);
+            metricCell(second, storage, false, () -> open(new Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)));
+            LinearLayout ip = metric("IP local", "network");
+            ipValue = metricValue(ip, "—");
+            ipValue.setTextSize(20);
+            metricDetail(ip, "Rede ativa");
+            metricCell(second, ip, true, () -> open(new Intent(Settings.ACTION_WIRELESS_SETTINGS)));
+            body.addView(second, size(-1, 119));
+
+        } else {
+            body.addView(pill("chip", "Ver métricas", () -> {
+                metricsForVisit = true;
+                show(Page.HUB, false);
+            }), size(-2, 48));
+        }
+        projectList = null;
+        if (PROJECTS.enabled(preferences)) {
+            gap(body, 17);
+            LinearLayout projects = row();
+            projects.addView(label("Projetos", 21, TEXT, "sans-serif-medium"),
+                    new LinearLayout.LayoutParams(0, d(44), 1));
+            projects.addView(pill("link", "Conectar JSON", this::chooseProjects), size(-2, 37));
+            body.addView(projects);
+            projectSource = label("", 12, MUTED, "sans-serif");
+            body.addView(projectSource, size(-1, -2));
+            gap(body, 10);
+            projectList = column(0, 0, 0, 0);
+            body.addView(projectList, size(-1, -2));
+            reloadProjects(false);
+        }
         updateMetrics();
-        reloadProjects(false);
         return layout;
     }
 
@@ -606,13 +684,14 @@ public final class HomeActivity extends Activity {
                 }
             }
             preferences.edit().putString("projects", file.toString()).apply();
-            if (page == Page.HUB) reloadProjects(false);
+            if (page == Page.HUB && projectList != null) reloadProjects(false);
         } catch (SecurityException e) {
             notice("O seletor não concedeu acesso ao arquivo");
         }
     }
 
     private void reloadProjects(boolean announce) {
+        if (projectList == null) return;
         int generation = ++projectsGeneration;
         String saved = preferences.getString("projects", null);
         Uri document = saved == null ? null : Uri.parse(saved);
@@ -800,38 +879,41 @@ public final class HomeActivity extends Activity {
             textSize.topMargin = d(4);
             addView(title, textSize);
             setOnClickListener(view -> launch(item));
-            setOnLongClickListener(view -> { appMenu(item); return true; });
+            setOnLongClickListener(view -> { appMenu(item, null); return true; });
         }
 
         void bind(LauncherActivityInfo app) {
             item = app;
             String name = appLabel(app);
-            setTextIfChanged(title, name);
+            boolean ownSettings = getPackageName().equals(app.getComponentName().getPackageName());
+            setTextIfChanged(title, ownSettings ? "Ajustes" : name);
             setContentDescription(name);
             icons.bind(icon, app);
         }
     }
 
-    private void appMenu(LauncherActivityInfo item) {
+    private void appMenu(LauncherActivityInfo item, NyRoSheet.Action slotAction) {
         ApplicationInfo app = item.getApplicationInfo();
+        boolean ownSettings = getPackageName().equals(app.packageName);
         boolean userApp = (app.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) == 0;
-        List<String> options = new ArrayList<>(List.of("Ocultar da gaveta", "Adicionar aos favoritos", "Informações do app"));
-        if (userApp) options.add("Desinstalar");
-        new AlertDialog.Builder(this).setTitle(appLabel(item))
-                .setItems(options.toArray(String[]::new), (dialog, option) -> {
-                    switch (option) {
-                        case 0 -> {
-                            Set<String> updated = hidden();
-                            updated.add(app.packageName);
-                            preferences.edit().putStringSet("hidden", updated).apply();
-                            filterDrawer();
-                        }
-                        case 1 -> chooseSlot(item);
-                        case 2 -> open(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                Uri.fromParts("package", app.packageName, null)));
-                        case 3 -> requestUninstall(app.packageName);
-                    }
-                }).show();
+        var actions = new ArrayList<NyRoSheet.Action>();
+        if (slotAction != null) actions.add(slotAction);
+        if (ownSettings) actions.add(new NyRoSheet.Action("Abrir configurações", "settings", this::openSettings));
+        actions.add(new NyRoSheet.Action("Adicionar aos favoritos", "star", () -> chooseSlot(item)));
+        if (!ownSettings) {
+            actions.add(new NyRoSheet.Action("Ocultar da gaveta", "eye-off", () -> {
+                Set<String> updated = hidden();
+                updated.add(app.packageName);
+                preferences.edit().putStringSet(LauncherPreferences.HIDDEN, updated).apply();
+                notice("App ocultado da gaveta");
+            }));
+        }
+        actions.add(new NyRoSheet.Action("Informações do app", "info", () -> open(new Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", app.packageName, null)))));
+        if (userApp && !ownSettings) {
+            actions.add(new NyRoSheet.Action("Desinstalar", "trash", () -> requestUninstall(app.packageName), true));
+        }
+        NyRoSheet.show(this, appLabel(item), appIcon(item), actions);
     }
 
     private void requestUninstall(String packageName) {
@@ -845,55 +927,45 @@ public final class HomeActivity extends Activity {
     }
 
     private void drawerMenu() {
-        new AlertDialog.Builder(this).setTitle("Gaveta de aplicativos")
-                .setItems(new String[]{"Restaurar apps ocultos"}, (dialog, option) -> restoreHidden())
-                .show();
-    }
-
-    private void restoreHidden() {
-        Set<String> hidden = hidden();
-        List<LauncherActivityInfo> items = new ArrayList<>();
-        for (LauncherActivityInfo item : installed) {
-            if (hidden.contains(item.getApplicationInfo().packageName)) items.add(item);
-        }
-        if (items.isEmpty()) {
-            notice("Nenhum app oculto");
-            return;
-        }
-        String[] labels = items.stream().map(this::appLabel).toArray(String[]::new);
-        new AlertDialog.Builder(this).setTitle("Restaurar app")
-                .setItems(labels, (dialog, choice) -> {
-                    hidden.remove(items.get(choice).getApplicationInfo().packageName);
-                    preferences.edit().putStringSet("hidden", hidden).apply();
-                    filterDrawer();
-                }).show();
+        NyRoSheet.show(this, "Gaveta de aplicativos", null, List.of(
+                new NyRoSheet.Action("Configurações NyRoOS", "settings", this::openSettings),
+                new NyRoSheet.Action("Restaurar apps ocultos", "eye",
+                        () -> NyRoSettingsActivity.showHidden(this, preferences, () -> {}))));
     }
 
     private Set<String> hidden() {
-        return new LinkedHashSet<>(preferences.getStringSet("hidden", Collections.emptySet()));
+        return LauncherPreferences.hiddenApps(preferences);
     }
 
-    private void slotMenu(String prefix, int index, LauncherActivityInfo current) {
-        String[] names = installed.stream().map(this::appLabel).toArray(String[]::new);
+    private void slotMenu(String prefix, int index) {
+        if (installed.isEmpty()) {
+            notice("Carregando aplicativos");
+            return;
+        }
         String title = prefix.equals("dock") ? "Trocar atalho do dock" : "Trocar favorito";
-        new AlertDialog.Builder(this).setTitle(title).setItems(names, (dialog, choice) -> {
-            String chosen = installed.get(choice).getApplicationInfo().packageName;
-            preferences.edit().putString(prefix + index, chosen).apply();
-            show(Page.HOME, false);
-        }).show();
+        List<NyRoSheet.Action> actions = new ArrayList<>();
+        for (LauncherActivityInfo item : installed) {
+            actions.add(new NyRoSheet.Action(appLabel(item), "grid", () -> {
+                preferences.edit().putString(prefix + index, item.getComponentName().getPackageName()).apply();
+                show(Page.HOME, false);
+            }));
+        }
+        NyRoSheet.show(this, title, null, actions);
     }
 
     private void chooseSlot(LauncherActivityInfo item) {
-        String[] names = new String[FAVORITES.length];
-        for (int index = 0; index < names.length; index++) {
-            LauncherActivityInfo current = slotApp("favorite" + index, FAVORITES[index]);
-            names[index] = (index + 1) + " · " + (current == null ? "Livre" : appLabel(current));
+        List<NyRoSheet.Action> actions = new ArrayList<>();
+        for (int index = 0; index < FAVORITE_APPS.length; index++) {
+            int slot = index;
+            LauncherActivityInfo current = slotApp("favorite" + index, FAVORITE_APPS[index]);
+            String title = (index + 1) + " · " + (current == null ? "Livre" : appLabel(current));
+            actions.add(new NyRoSheet.Action(title, "star", () -> {
+                preferences.edit().putString("favorite" + slot, item.getComponentName().getPackageName()).apply();
+                homePage = null;
+                notice("Favorito atualizado");
+            }));
         }
-        new AlertDialog.Builder(this).setTitle("Substituir favorito")
-                .setItems(names, (dialog, choice) -> {
-                    preferences.edit().putString("favorite" + choice, item.getApplicationInfo().packageName).apply();
-                    notice("Favorito atualizado");
-                }).show();
+        NyRoSheet.show(this, "Escolher posição", appIcon(item), actions);
     }
 
     private void loadApps() {
@@ -904,7 +976,8 @@ public final class HomeActivity extends Activity {
                 for (LauncherActivityInfo item : launcher.getActivityList(null, Process.myUserHandle())) {
                     ComponentName component = item.getComponentName();
                     String name = component.getPackageName();
-                    if (name.equals(getPackageName()) || name.equals("com.android.launcher3")) continue;
+                    if (name.equals("com.android.launcher3")) continue;
+                    if (name.equals(getPackageName()) && !component.getClassName().equals(NyRoSettingsActivity.class.getName())) continue;
                     if (name.equals(GOOGLE) && component.getShortClassName().equals(".SearchActivity")) {
                         byPackage.put(name, item);
                     } else {
@@ -981,6 +1054,10 @@ public final class HomeActivity extends Activity {
     private void launch(LauncherActivityInfo app) {
         if (app == null) {
             notice("Aplicativo não disponível");
+            return;
+        }
+        if (NyRoSettingsActivity.class.getName().equals(app.getComponentName().getClassName())) {
+            openSettings();
             return;
         }
         hideKeyboard();

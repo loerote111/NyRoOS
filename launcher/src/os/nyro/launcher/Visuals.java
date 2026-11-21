@@ -116,6 +116,34 @@ final class Visuals {
                 case "right" -> line(canvas, 9, 5, 16, 12, 9, 19);
                 case "up" -> line(canvas, 5, 15, 12, 8, 19, 15);
                 case "down" -> line(canvas, 5, 9, 12, 16, 19, 9);
+                case "close" -> { line(canvas, 6, 6, 18, 18); line(canvas, 18, 6, 6, 18); }
+                case "settings" -> {
+                    line(canvas, 4, 6, 20, 6);
+                    line(canvas, 4, 12, 20, 12);
+                    line(canvas, 4, 18, 20, 18);
+                    canvas.drawCircle(9, 6, 2, paint);
+                    canvas.drawCircle(16, 12, 2, paint);
+                    canvas.drawCircle(9, 18, 2, paint);
+                }
+                case "star" -> line(canvas, 12,3, 14.7f,8.6f, 21,9.4f, 16.4f,13.9f,
+                        17.5f,20, 12,17, 6.5f,20, 7.6f,13.9f, 3,9.4f, 9.3f,8.6f, 12,3);
+                case "eye", "eye-off" -> {
+                    canvas.drawOval(3, 7, 21, 17, paint);
+                    canvas.drawCircle(12, 12, 2.8f, paint);
+                    if (type.equals("eye-off")) line(canvas, 5, 4, 19, 20);
+                }
+                case "info" -> {
+                    canvas.drawCircle(12, 12, 8.5f, paint);
+                    line(canvas, 12, 11, 12, 16);
+                    canvas.drawPoint(12, 8, paint);
+                }
+                case "trash" -> {
+                    line(canvas, 4, 6, 20, 6);
+                    line(canvas, 6, 6, 7.5f, 20, 16.5f, 20, 18, 6);
+                    line(canvas, 9, 6, 9, 3.5f, 15, 3.5f, 15, 6);
+                    line(canvas, 10.5f, 9.5f, 10.5f, 16.5f);
+                    line(canvas, 13.5f, 9.5f, 13.5f, 16.5f);
+                }
                 case "more" -> {
                     paint.setStyle(Paint.Style.FILL);
                     for (int x = 5; x <= 19; x += 7) canvas.drawCircle(x, 12, 1.6f, paint);
