@@ -122,6 +122,7 @@ def stage_release(args):
         stage = Path(workspace) / tag
         stage.mkdir()
         names = {}
+        apk_metadata = {}
         sdk = Path(os.environ["ANDROID_HOME"]) / "build-tools/37.0.0"
         signers = json.loads((ROOT / "ota/apk-signers.json").read_bytes())
         for app, package in APPS.items():
@@ -131,9 +132,12 @@ def stage_release(args):
             if fingerprints != [signers[app]]:
                 raise ValueError(f"{source.name} foi assinado com certificado diferente do release.")
             badging = subprocess.check_output([sdk / "aapt2", "dump", "badging", source], text=True)
-            if not badging.startswith(f"package: name='{package}' "):
+            identity = re.match(r"package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'", badging)
+            if not identity or identity[1] != package:
                 raise ValueError(f"Identidade inesperada em {source.name}.")
-            names[app + ".apk"] = source
+            name = app + ".apk"
+            names[name] = source
+            apk_metadata[name] = {"packageName": package, "versionCode": int(identity[2]), "versionName": identity[3]}
         ota_name = f"NyRoOS-{args.version}-ota.zip"
         if args.ota:
             names[ota_name] = args.ota
@@ -143,8 +147,12 @@ def stage_release(args):
                 raise ValueError(f"{source.name} excede o limite de asset do GitHub.")
             file = stage / name
             shutil.copyfile(source, file)
+            if args.raw_assets and name in apk_metadata:
+                url = f"https://raw.githubusercontent.com/{repo}/main/ota/releases/{tag}/{name}"
+            else:
+                url = f"https://github.com/{repo}/releases/download/{tag}/{name}"
             assets.append({"name": name, "size": file.stat().st_size, "sha256": digest(file),
-                           "url": f"https://github.com/{repo}/releases/download/{tag}/{name}"})
+                           "url": url, **apk_metadata.get(name, {})})
         record = {"schema": 1, "version": args.version, "demo": False, "otaAvailable": bool(metadata),
                   "changelog": changes, "artifacts": assets}
         if metadata:
@@ -182,6 +190,8 @@ def stage_release(args):
                "--title", f"NyRoOS {tag}", "--notes-file", str(target / "RELEASE_NOTES.md"),
                *(str(target / name) for name in names), str(target / "SHA256SUMS"), str(target / "ota.json")]
     print(f"Release preparada em {target}")
+    if args.raw_assets:
+        print(f"Publique os APKs do pacote em ota/releases/{tag} junto ao ota/ota.json assinado.")
     print(shlex.join(command))
 
 
@@ -193,6 +203,7 @@ def main():
     parser.add_argument("--notes", type=Path)
     parser.add_argument("--ota", type=Path)
     parser.add_argument("--replace", action="store_true")
+    parser.add_argument("--raw-assets", action="store_true", help="usar APKs versionados na branch main")
     args = parser.parse_args()
     if args.feed_url:
         print(f"https://raw.githubusercontent.com/{repository()}/main/ota/ota.json")

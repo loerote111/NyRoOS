@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.PermissionInfo;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -21,11 +23,14 @@ import android.text.TextWatcher;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Switch;
@@ -36,9 +41,14 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Executors;
+
+import rikka.shizuku.Shizuku;
 
 public final class CoreActivity extends Activity {
     private static final int BG=0xff11131a, PANEL=0xff1a1d28, EDGE=0xff333044, PURPLE=0xffb29aff,
@@ -48,17 +58,34 @@ public final class CoreActivity extends Activity {
     private final java.util.concurrent.ExecutorService tasks = Executors.newSingleThreadExecutor();
     private SharedPreferences prefs;
     private AppDirectory directory;
-    private LinearLayout header, body, list;
+    private LinearLayout header, body;
+    private FrameLayout pages;
+    private AppsAdapter appsAdapter;
+    private final android.util.LruCache<String, android.graphics.drawable.Drawable.ConstantState> appIcons =
+            new android.util.LruCache<>(48);
+    private final java.util.concurrent.ExecutorService icons = Executors.newSingleThreadExecutor();
     private boolean appsTab, busy;
     private String status="Verifique se há uma nova versão do NyRoOS.";
     private String filter="De usuário";
     private EditText search;
     private OtaClient.Release release;
+    private List<OtaClient.AppRelease> appUpdates = List.of();
+    private final Map<String, File> readyApks = new HashMap<>();
+    private TextView updateStatus;
     private File downloaded;
     private int progress=-1;
     private TextView downloadText;
     private ProgressBar bar;
     private List<AppDirectory.App> installed = List.of();
+    private TextView shellStatus;
+    private final Shizuku.OnBinderReceivedListener shellConnected = this::updateShellStatus;
+    private final Shizuku.OnBinderDeadListener shellDisconnected = this::updateShellStatus;
+    private final Shizuku.OnRequestPermissionResultListener shellPermission = (code, result) -> {
+        if (code != 31) return;
+        updateShellStatus();
+        if (result == PackageManager.PERMISSION_GRANTED) testShell();
+        else notify("Autorização do Shizuku recusada.");
+    };
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
@@ -77,31 +104,39 @@ public final class CoreActivity extends Activity {
         setContentView(root);
         header = column(24);
         root.addView(header, lp(-1,-2));
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setVerticalScrollBarEnabled(false);
-        root.addView(scroll, new LinearLayout.LayoutParams(-1,0,1));
-        body=column(24);
-        body.setPadding(d(24),d(23),d(24),d(24));
-        scroll.addView(body, new ScrollView.LayoutParams(-1,-2));
+        pages = new FrameLayout(this);
+        root.addView(pages, new LinearLayout.LayoutParams(-1,0,1));
         render();
+        Shizuku.addBinderReceivedListenerSticky(shellConnected);
+        Shizuku.addBinderDeadListener(shellDisconnected);
+        Shizuku.addRequestPermissionResultListener(shellPermission);
     }
 
     @Override protected void onResume() {
         super.onResume();
-        if (appsTab && list != null) loadApps();
+        if (appsTab && appsAdapter != null) loadApps();
+        updateShellStatus();
     }
 
     @Override protected void onDestroy() {
+        Shizuku.removeBinderReceivedListener(shellConnected);
+        Shizuku.removeBinderDeadListener(shellDisconnected);
+        Shizuku.removeRequestPermissionResultListener(shellPermission);
         tasks.shutdownNow();
+        icons.shutdownNow();
         super.onDestroy();
     }
 
     private void render() {
         header.removeAllViews();
-        body.removeAllViews();
+        pages.removeAllViews();
+        body = column(24);
+        body.setPadding(d(24),d(23),d(24),d(24));
+        appsAdapter = null;
         bar = null;
         downloadText = null;
+        updateStatus = null;
+        shellStatus = null;
         gap(header,10);
         LinearLayout brand = row();
         ImageView icon = new ImageView(this);
@@ -118,7 +153,24 @@ public final class CoreActivity extends Activity {
         chip(tabs,"Atualização",!appsTab,() -> { appsTab=false; render(); });
         chip(tabs,"Orquestrador",appsTab,() -> { appsTab=true; render(); });
         header.addView(tabs,lp(-1,49));
-        if (appsTab) renderApps(); else renderOta();
+        if (appsTab) {
+            ListView list = new ListView(this);
+            list.setDivider(null);
+            list.setItemsCanFocus(true);
+            list.setVerticalScrollBarEnabled(false);
+            list.addHeaderView(body, null, false);
+            appsAdapter = new AppsAdapter();
+            list.setAdapter(appsAdapter);
+            pages.addView(list, new FrameLayout.LayoutParams(-1,-1));
+            renderApps();
+        } else {
+            ScrollView scroll = new ScrollView(this);
+            scroll.setFillViewport(true);
+            scroll.setVerticalScrollBarEnabled(false);
+            scroll.addView(body, new ScrollView.LayoutParams(-1,-2));
+            pages.addView(scroll, new FrameLayout.LayoutParams(-1,-1));
+            renderOta();
+        }
     }
 
     private void renderOta() {
@@ -137,7 +189,9 @@ public final class CoreActivity extends Activity {
         action(actions,"Verificar atualizações",true,!busy,this::check);
         body.addView(actions,lp(-1,54));
         gap(body,10);
-        body.addView(text(status,13,MUTED,false),lp(-1,-2));
+        updateStatus = text(status,13,MUTED,false);
+        body.addView(updateStatus,lp(-1,-2));
+        for (var app : appUpdates) showAppUpdate(app);
         if (release != null) showRelease();
         gap(body,20);
         LinearLayout config=card(PANEL);
@@ -150,6 +204,61 @@ public final class CoreActivity extends Activity {
         gap(config,9);
         specialAction(config,"Selecionar configuração",() -> pickDocument(PICK_CONFIG),!busy);
         body.addView(config,lp(-1,-2));
+    }
+
+    private void showAppUpdate(OtaClient.AppRelease app) {
+        gap(body,14);
+        LinearLayout panel = card(PANEL);
+        panel.addView(text(app.name() + " " + app.versionName(),19,TEXT,true),lp(-1,-2));
+        gap(panel,5);
+        panel.addView(text("Atualização do aplicativo",13,MUTED,false),lp(-1,-2));
+        gap(panel,10);
+        File apk = readyApks.get(app.packageName());
+        if (apk == null) {
+            specialAction(panel,"Baixar " + app.name(),() -> downloadApp(app),!busy);
+        } else {
+            specialAction(panel,"Instalar " + app.name(),() -> installApp(apk),!busy);
+        }
+        body.addView(panel,lp(-1,-2));
+    }
+
+    private void downloadApp(OtaClient.AppRelease app) {
+        busy = true;
+        status = "Baixando " + app.name() + "…";
+        render();
+        tasks.execute(() -> {
+            try {
+                File apk = OtaClient.downloadApp(this, app, progress -> onUi(() -> {
+                    status = "Baixando " + app.name() + " · " + progress + "%";
+                    if (updateStatus != null) updateStatus.setText(status);
+                }));
+                onUi(() -> {
+                    readyApks.put(app.packageName(), apk);
+                    status = app.name() + " · download e assinatura verificados.";
+                    Log.i(TAG, status);
+                    finishAction();
+                });
+            } catch (Exception error) {
+                failure("Falha ao baixar " + app.name() + ".", error);
+            }
+        });
+    }
+
+    private void installApp(File apk) {
+        if (!apk.isFile()) {
+            notify("O APK expirou. Verifique e baixe a atualização novamente.");
+            return;
+        }
+        if (!getPackageManager().canRequestPackageInstalls()) {
+            notify("Autorize esta fonte e toque em Instalar novamente.");
+            openSetting(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        Uri uri = new Uri.Builder().scheme("content").authority(UpdateFiles.AUTHORITY).appendPath(apk.getName()).build();
+        Intent installer = new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, UpdateFiles.APK_MIME)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        openSetting(installer);
     }
 
     private void showRelease() {
@@ -180,7 +289,7 @@ public final class CoreActivity extends Activity {
         LinearLayout row=row();
         action(row,downloaded == null ? "Baixar pacote" : "Baixar novamente",downloaded == null,!busy,this::download);
         gapX(row,8);
-        action(row,"Instalar Agora",true,downloaded != null && !busy && !release.demo(),this::confirmInstall);
+        action(row,"Instalar Agora",true,downloaded != null && !busy && !release.demo() && canInstallSystemOta(),this::confirmInstall);
         panel.addView(row,lp(-1,46));
         if (release.demo()) {
             gap(panel,9);
@@ -202,17 +311,25 @@ public final class CoreActivity extends Activity {
         release=null;
         downloaded=null;
         progress=-1;
+        appUpdates=List.of();
+        readyApks.clear();
         status="Consultando catálogo assinado…";
         render();
         tasks.execute(() -> {
             try {
                 String link=readFeedConfiguration();
-                OtaClient.Release item=OtaClient.check(this,link);
+                OtaClient.Catalog catalog=OtaClient.check(this,link);
                 onUi(() -> {
-                    release=item;
-                    status=item == null ? "Catálogo assinado verificado. Nenhum OTA disponível." : "Catálogo assinado verificado.";
-                    if (item == null) Log.i(TAG,"Catálogo assinado verificado. Nenhum OTA disponível.");
-                    if (item != null) Log.i(TAG,"Catálogo verificado: NyRoOS " + item.version() + ", demo=" + item.demo());
+                    release=catalog.system();
+                    appUpdates=catalog.apps();
+                    if (!appUpdates.isEmpty()) {
+                        status="Catálogo assinado verificado. Atualização de aplicativos disponível.";
+                    } else if (release != null) {
+                        status="Catálogo assinado verificado.";
+                    } else {
+                        status="Catálogo assinado verificado. Nenhum OTA disponível.";
+                    }
+                    Log.i(TAG,status);
                     finishAction();
                 });
             } catch (Exception e) {
@@ -251,10 +368,15 @@ public final class CoreActivity extends Activity {
         });
     }
 
+    private boolean canInstallSystemOta() {
+        return Build.DISPLAY.startsWith("NyRoOS ")
+                && checkSelfPermission("android.permission.RECOVERY") == PackageManager.PERMISSION_GRANTED;
+    }
+
     private void confirmInstall() {
         OtaClient.Release item=release;
         File file=downloaded;
-        if (busy || item == null || item.demo() || file == null) return;
+        if (busy || item == null || item.demo() || file == null || !canInstallSystemOta()) return;
         new AlertDialog.Builder(this).setTitle("Instalar NyRoOS " + item.version())
                 .setMessage("O dispositivo será reiniciado no recovery para instalar a atualização verificada.")
                 .setNegativeButton("Cancelar",null).setPositiveButton("Instalar Agora",(dialog,button) -> {
@@ -288,6 +410,14 @@ public final class CoreActivity extends Activity {
         title("Orquestrador\nde apps");
         TextView intro=text("Acompanhe seus projetos e abra os controles de acesso do Android.",15,MUTED,false);
         body.addView(intro,lp(-1,-2));
+        gap(body,14);
+        LinearLayout shell = card(0xff201b2d);
+        shellStatus = text("",14,MUTED,false);
+        shell.addView(shellStatus,lp(-1,-2));
+        gap(shell,7);
+        specialAction(shell,"Conectar ao Shizuku",this::connectShell,true);
+        body.addView(shell,lp(-1,-2));
+        updateShellStatus();
         gap(body,14);
         search=new EditText(this);
         search.setSingleLine(true);
@@ -329,13 +459,12 @@ public final class CoreActivity extends Activity {
                 () -> pickDocument(EXPORT_REPORT),true);
         body.addView(report,lp(-1,-2));
         gap(body,14);
-        list=column(0);
-        body.addView(list,lp(-1,-2));
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s,int start,int count,int after) {}
             @Override public void onTextChanged(CharSequence s,int start,int before,int count) { populateApps(); }
             @Override public void afterTextChanged(Editable s) {}
         });
+        populateApps();
         loadApps();
     }
 
@@ -350,27 +479,61 @@ public final class CoreActivity extends Activity {
     }
 
     private void populateApps() {
-        if (!appsTab || list == null || search == null) return;
-        list.removeAllViews();
+        if (!appsTab || appsAdapter == null || search == null) return;
         String query=search.getText().toString().toLowerCase(Locale.ROOT).trim();
+        var visible = new ArrayList<AppDirectory.App>();
         for (AppDirectory.App app : installed) {
-            boolean approved=directory.approved(app);
-            if (filter.equals("De usuário") && app.system() || filter.equals("Acompanhados") && !approved) continue;
-            if (!(app.name().toLowerCase(Locale.ROOT).contains(query) || app.id().toLowerCase(Locale.ROOT).contains(query))) continue;
-            showApp(app,approved);
+            if (filter.equals("De usuário") && app.system()
+                    || filter.equals("Acompanhados") && !directory.approved(app)) continue;
+            if (!query.isEmpty() && !app.name().toLowerCase(Locale.ROOT).contains(query)
+                    && !app.id().toLowerCase(Locale.ROOT).contains(query)) continue;
+            visible.add(app);
         }
-        if (list.getChildCount()==0)
-            list.addView(text("Nenhum app neste filtro.",14,MUTED,false),lp(-1,-2));
+        appsAdapter.entries = visible;
+        appsAdapter.notifyDataSetChanged();
     }
 
-    private void showApp(AppDirectory.App app,boolean approved) {
+    private final class AppsAdapter extends BaseAdapter {
+        List<AppDirectory.App> entries = List.of();
+
+        @Override public int getCount() { return Math.max(1, entries.size()); }
+        @Override public AppDirectory.App getItem(int position) { return entries.isEmpty() ? null : entries.get(position); }
+        @Override public long getItemId(int position) { return position; }
+        @Override public boolean isEnabled(int position) { return !entries.isEmpty(); }
+
+        @Override public View getView(int position, View recycled, ViewGroup parent) {
+            FrameLayout row = new FrameLayout(CoreActivity.this);
+            row.setPadding(d(24),0,d(24),d(9));
+            AppDirectory.App app = getItem(position);
+            View tile = app == null ? text("Nenhum app neste filtro.",14,MUTED,false)
+                    : showApp(app, directory.approved(app));
+            row.addView(tile, new FrameLayout.LayoutParams(-1,-2));
+            return row;
+        }
+    }
+
+    private View showApp(AppDirectory.App app,boolean approved) {
         LinearLayout tile=card(PANEL);
         LinearLayout line=row();
         ImageView icon=new ImageView(this);
-        try {
-            icon.setImageDrawable(getPackageManager().getApplicationIcon(app.id()));
-        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
-            icon.setImageResource(R.drawable.core_icon);
+        icon.setImageResource(R.drawable.core_icon);
+        var cached = appIcons.get(app.id());
+        if (cached != null) {
+            icon.setImageDrawable(cached.newDrawable(getResources()));
+        } else {
+            var view = new java.lang.ref.WeakReference<>(icon);
+            icons.execute(() -> {
+                try {
+                    var state = getPackageManager().getApplicationIcon(app.id()).getConstantState();
+                    if (state != null) onUi(() -> {
+                        appIcons.put(app.id(), state);
+                        ImageView target = view.get();
+                        if (target != null) target.setImageDrawable(state.newDrawable(getResources()));
+                    });
+                } catch (PackageManager.NameNotFoundException ignored) {
+                    // The package may have been removed while the card was loading.
+                }
+            });
         }
         line.addView(icon,lp(39,39));
         LinearLayout label=column(0);
@@ -404,8 +567,121 @@ public final class CoreActivity extends Activity {
         gapX(actions,8);
         action(actions,"Bateria",false,true,() -> openSetting(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
         tile.addView(actions,lp(-1,42));
-        list.addView(tile,lp(-1,-2));
-        gap(list,9);
+        if (ShellUserService.canManage(app.id(), app.system())) {
+            gap(tile,8);
+            specialAction(tile,"Ações via Shizuku",() -> chooseShellAction(app),true);
+        }
+        return tile;
+    }
+
+    private void updateShellStatus() {
+        onUi(() -> {
+            if (shellStatus == null) return;
+            String statusText = "Shizuku precisa estar ativo via ADB.";
+            if (ShellActions.active()) {
+                statusText = ShellActions.authorized() ? "Shizuku autorizado · Shell (UID 2000)"
+                        : "Shizuku ativo · autorize o NyRoCore";
+            }
+            shellStatus.setText(statusText);
+        });
+    }
+
+    private void connectShell() {
+        if (!ShellActions.active()) {
+            Intent manager = getPackageManager().getLaunchIntentForPackage("moe.shizuku.privileged.api");
+            if (manager != null) openSetting(manager);
+            else notify("Instale e inicie o Shizuku via ADB.");
+            return;
+        }
+        try {
+            if (ShellActions.authorized()) testShell();
+            else if (Shizuku.shouldShowRequestPermissionRationale()) {
+                notify("Autorize o NyRoCore na lista de apps do Shizuku.");
+            } else Shizuku.requestPermission(31);
+        } catch (RuntimeException error) {
+            notify("O serviço Shizuku foi desconectado.");
+        }
+    }
+
+    private void testShell() {
+        runShell(ShellActions.Action.STATUS, null, null);
+    }
+
+    private record AppAction(String label, ShellActions.Action action, String argument) {}
+
+    private void chooseShellAction(AppDirectory.App app) {
+        if (!ShellActions.authorized()) {
+            connectShell();
+            return;
+        }
+        var options = new ArrayList<AppAction>();
+        try {
+            var pm = getPackageManager();
+            var info = pm.getPackageInfo(app.id(), PackageManager.GET_PERMISSIONS);
+            int enabled = pm.getApplicationEnabledSetting(app.id());
+            boolean disabled = enabled == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                    || enabled == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+                    || enabled == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED;
+            options.add(new AppAction(disabled ? "Reativar app" : "Desativar app",
+                    disabled ? ShellActions.Action.ENABLE : ShellActions.Action.DISABLE, null));
+            if (!app.system()) {
+                boolean exempt = getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(app.id());
+                options.add(new AppAction(exempt ? "Voltar à otimização de bateria" : "Isentar da otimização de bateria",
+                        exempt ? ShellActions.Action.BATTERY_DEFAULT : ShellActions.Action.BATTERY_EXEMPT, null));
+                if (info.requestedPermissions != null) {
+                    for (int i=0; i<info.requestedPermissions.length; i++) {
+                        String permission = info.requestedPermissions[i];
+                        if (ShellUserService.APP_OPS.containsKey(permission)) {
+                            options.add(new AppAction("Permitir " + permission.substring(permission.lastIndexOf('.') + 1),
+                                    ShellActions.Action.ALLOW_APP_OP, permission));
+                            continue;
+                        }
+                        try {
+                            var detail = pm.getPermissionInfo(permission, 0);
+                            if (detail.getProtection() == PermissionInfo.PROTECTION_DANGEROUS
+                                    && (info.requestedPermissionsFlags == null ||
+                                    (info.requestedPermissionsFlags[i] & android.content.pm.PackageInfo.REQUESTED_PERMISSION_GRANTED) == 0)) {
+                                options.add(new AppAction("Conceder " + permission.substring(permission.lastIndexOf('.') + 1),
+                                        ShellActions.Action.GRANT_PERMISSION, permission));
+                            }
+                        } catch (PackageManager.NameNotFoundException ignored) {
+                            // Permissions declared by unavailable packages are not selectable.
+                        }
+                    }
+                }
+            }
+        } catch (PackageManager.NameNotFoundException error) {
+            notify("O aplicativo foi removido.");
+            return;
+        }
+        String[] labels = options.stream().map(AppAction::label).toArray(String[]::new);
+        new AlertDialog.Builder(this).setTitle(app.name()).setItems(labels, (dialog, index) -> {
+            AppAction selection = options.get(index);
+            new AlertDialog.Builder(this).setTitle(selection.label())
+                    .setMessage("Aplicar a alteração a " + app.id() + "?")
+                    .setNegativeButton("Cancelar", null).setPositiveButton("Aplicar", (confirm, button) ->
+                            runShell(selection.action(), app.id(), selection.argument())).show();
+        }).setNegativeButton("Cancelar", null).show();
+    }
+
+    private void runShell(ShellActions.Action action, String packageName, String argument) {
+        tasks.execute(() -> {
+            try {
+                String result = ShellActions.run(action, packageName, argument);
+                onUi(() -> {
+                    if (action == ShellActions.Action.STATUS) {
+                        Log.i(TAG,"Shizuku UserService UID=" + result);
+                        notify("Conexão Shell confirmada · UID " + result);
+                    } else {
+                        notify(result);
+                        loadApps();
+                    }
+                });
+            } catch (Exception error) {
+                Log.w(TAG,"Falha na ação Shizuku: " + action, error);
+                onUi(() -> notify(error.getMessage() == null ? "O Android recusou a alteração." : error.getMessage()));
+            }
+        });
     }
 
     private void changeApproval(AppDirectory.App app,boolean approved) {

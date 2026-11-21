@@ -1,6 +1,7 @@
 package com.nyroos.core;
 
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.RecoverySystem;
 import android.util.Base64;
@@ -24,6 +25,8 @@ import java.security.MessageDigest;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -33,6 +36,13 @@ import java.util.zip.ZipFile;
 final class OtaClient {
     private static final long MAX_PACKAGE = 6L * 1024 * 1024 * 1024;
     private static final int MAX_MANIFEST = 96 * 1024;
+    private static final long MAX_APK = 128L * 1024 * 1024;
+    private static final Map<String, String> APP_IDS = Map.of(
+            "NyRoLauncher.apk", "os.nyro.launcher", "NyRoCore.apk", "com.nyroos.core");
+
+    record AppRelease(String name, String packageName, long versionCode, String versionName,
+                      URI url, long bytes, byte[] hash) {}
+    record Catalog(Release system, List<AppRelease> apps) {}
     record Release(String version, String device, String sourceBuild, URI url, byte[] hash,
                    long bytes, List<String> changes, boolean demo) {}
 
@@ -66,7 +76,7 @@ final class OtaClient {
         return false;
     }
 
-    static Release check(Context context, String address) throws Exception {
+    static Catalog check(Context context, String address) throws Exception {
         URI feed = checkedUri(address, true);
         HttpURLConnection connection = open(feed, false);
         JSONObject envelope;
@@ -92,13 +102,17 @@ final class OtaClient {
         String version = item.getString("version");
         if (!validVersion(version)) throw new IOException("Versão inválida no catálogo.");
         if (item.optInt("schema", 1) != 1) throw new IOException("Formato de catálogo incompatível.");
-        if (!item.optBoolean("otaAvailable", true)) return null;
+        List<AppRelease> apps = appReleases(context, feed, item.optJSONArray("artifacts"));
+        Release system = systemRelease(feed, item, version);
+        return new Catalog(system, apps);
+    }
+
+    private static Release systemRelease(URI feed, JSONObject item, String version) throws Exception {
+        if (!item.optBoolean("otaAvailable", true) || currentVersion().isEmpty()) return null;
         boolean demo = item.getBoolean("demo");
         String device = item.getString("device");
         String base = item.getString("baseFingerprint");
-        if (!device.equals(Build.DEVICE) || !base.equals(Build.FINGERPRINT))
-            throw new IOException("Atualização destinada a outra imagem.");
-        if (currentVersion().isEmpty()) throw new IOException("Build NyRoOS não identificada.");
+        if (!device.equals(Build.DEVICE) || !base.equals(Build.FINGERPRINT)) return null;
         if (!newer(version, currentVersion())) return null;
         URI url = checkedUri(item.getString("url"), demo);
         if (!demo && !feed.getScheme().equals("https"))
@@ -119,44 +133,119 @@ final class OtaClient {
         return new Release(version, device, base, url, checksum, bytes, List.copyOf(changes), demo);
     }
 
+    private static List<AppRelease> appReleases(Context context, URI feed, JSONArray artifacts) throws Exception {
+        if (artifacts == null) return List.of();
+        boolean localTest = "http".equals(feed.getScheme());
+        if (artifacts.length() > 20) throw new IOException("Catálogo com muitos artefatos.");
+        var results = new ArrayList<AppRelease>();
+        var seen = new HashSet<String>();
+        for (int i = 0; i < artifacts.length(); i++) {
+            JSONObject item = artifacts.getJSONObject(i);
+            String name = item.getString("name");
+            String packageName = APP_IDS.get(name);
+            if (packageName == null || !item.has("versionCode")) continue;
+            if (!packageName.equals(item.getString("packageName")) || !seen.add(packageName))
+                throw new IOException("Identidade de APK inválida no catálogo.");
+            long version = item.getLong("versionCode");
+            long size = item.getLong("size");
+            String hash = item.getString("sha256");
+            String versionName = item.getString("versionName");
+            if (version <= 0 || size <= 0 || size > MAX_APK || !hash.matches("[0-9a-f]{64}")
+                    || !validVersion(versionName))
+                throw new IOException("Metadados do APK inválidos.");
+            URI url = checkedUri(item.getString("url"), localTest);
+            try {
+                var installed = context.getPackageManager().getPackageInfo(packageName, 0);
+                if (version > installed.getLongVersionCode()) {
+                    results.add(new AppRelease(name.substring(0, name.length() - 4), packageName, version,
+                            versionName, url, size, java.util.HexFormat.of().parseHex(hash)));
+                }
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // The catalog only updates NyRoOS apps already installed on this device.
+            }
+        }
+        return List.copyOf(results);
+    }
+
     static File download(Context context, Release release, IntConsumer progress) throws Exception {
         File cache = new File(context.getCacheDir(), "ota");
-        Files.createDirectories(cache.toPath());
-        if (cache.getUsableSpace() < release.bytes()) throw new IOException("Espaço insuficiente para o pacote.");
-        File partial = File.createTempFile("incoming-", ".part", cache);
+        File partial = downloadVerified(cache, release.url(), release.bytes(), release.hash(), progress);
         try {
-            HttpURLConnection connection = open(release.url(), true);
+            if (!release.demo()) verifyRecovery(partial, release);
+            return saveDownload(partial, cache, "nyroos-" + release.version() + ".zip");
+        } finally {
+            Files.deleteIfExists(partial.toPath());
+        }
+    }
+
+    static File downloadApp(Context context, AppRelease release, IntConsumer progress) throws Exception {
+        File cache = new File(context.getCacheDir(), "app-updates");
+        File partial = downloadVerified(cache, release.url(), release.bytes(), release.hash(), progress);
+        try {
+            var pm = context.getPackageManager();
+            var installed = pm.getPackageInfo(release.packageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+            var fetched = pm.getPackageArchiveInfo(partial.getPath(), PackageManager.GET_SIGNING_CERTIFICATES);
+            if (fetched == null || !release.packageName().equals(fetched.packageName)
+                    || fetched.getLongVersionCode() != release.versionCode()
+                    || !release.versionName().equals(fetched.versionName)
+                    || release.versionCode() <= installed.getLongVersionCode()
+                    || !signers(fetched.signingInfo).equals(signers(installed.signingInfo))) {
+                throw new IOException("O APK não corresponde à identidade ou assinatura do app instalado.");
+            }
+            return saveDownload(partial, cache, release.packageName() + "-" + release.versionCode() + ".apk");
+        } finally {
+            Files.deleteIfExists(partial.toPath());
+        }
+    }
+
+    private static HashSet<android.content.pm.Signature> signers(android.content.pm.SigningInfo info) throws IOException {
+        if (info == null || info.getApkContentsSigners().length == 0)
+            throw new IOException("Certificado do APK ausente.");
+        return new HashSet<>(Arrays.asList(info.getApkContentsSigners()));
+    }
+
+    private static File saveDownload(File partial, File directory, String name) throws IOException {
+        File saved = new File(directory, name);
+        Files.move(partial.toPath(), saved.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        return saved;
+    }
+
+    private static File downloadVerified(File cache, URI uri, long size, byte[] hash, IntConsumer progress)
+            throws Exception {
+        Files.createDirectories(cache.toPath());
+        if (cache.getUsableSpace() < size) throw new IOException("Espaço insuficiente para o pacote.");
+        File partial = File.createTempFile("incoming-", ".apk", cache);
+        boolean valid = false;
+        try {
+            HttpURLConnection connection = open(uri, true);
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             try (InputStream input = connection.getInputStream(); FileOutputStream output = new FileOutputStream(partial)) {
-                if (connection.getContentLengthLong() >= 0 && connection.getContentLengthLong() != release.bytes())
+                if (connection.getContentLengthLong() >= 0 && connection.getContentLengthLong() != size)
                     throw new IOException("Tamanho recebido difere do catálogo.");
                 byte[] buffer = new byte[65536];
                 long count = 0;
                 int previous = -1;
                 for (int length; (length = input.read(buffer)) != -1;) {
                     count += length;
-                    if (count > release.bytes()) throw new IOException("O pacote excedeu o tamanho declarado.");
+                    if (count > size) throw new IOException("O pacote excedeu o tamanho declarado.");
                     output.write(buffer, 0, length);
                     digest.update(buffer, 0, length);
-                    int percent = (int) (count * 100 / release.bytes());
+                    int percent = (int) (count * 100 / size);
                     if (percent != previous) {
                         progress.accept(percent);
                         previous = percent;
                     }
                 }
-                if (count != release.bytes() || !MessageDigest.isEqual(digest.digest(), release.hash())) {
+                if (count != size || !MessageDigest.isEqual(digest.digest(), hash))
                     throw new IOException("A integridade do pacote não confere.");
-                }
                 output.getFD().sync();
             } finally {
                 connection.disconnect();
             }
-            if (!release.demo()) verifyRecovery(partial, release);
-            File saved = new File(cache, "nyroos-" + release.version() + ".zip");
-            Files.move(partial.toPath(), saved.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            return saved;
+            valid = true;
+            return partial;
         } finally {
-            Files.deleteIfExists(partial.toPath());
+            if (!valid) Files.deleteIfExists(partial.toPath());
         }
     }
 

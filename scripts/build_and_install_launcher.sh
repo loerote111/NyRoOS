@@ -80,13 +80,15 @@ platform="$ANDROID_HOME/platforms/android-37.0/android.jar"
 payload="$project/custom/priv-app/NyRoLauncher"
 keystore="$ANDROID_USER_HOME/nyrolauncher.p12"
 export JDK_JAVA_OPTIONS="-XX:+PerfDisableSharedMem -Djava.io.tmpdir=$TMPDIR"
-mkdir -p -- "$stage/generated" "$stage/classes" "$stage/dex" "$payload"
+mkdir -p -- "$stage/generated" "$stage/classes" "$stage/dex" "$stage/assets" "$payload"
+cp -a "$project/launcher/assets/." "$stage/assets/"
+install -m 0644 "$project/custom/media/nyroos_wallpaper.png" "$stage/assets/nyroos_wallpaper.png"
 
 printf 'Compilando NyRoLauncher com javac, AAPT2 e D8.\n'
 "$build_tools/aapt2" compile --dir "$project/launcher/res" -o "$stage/resources.zip"
 "$build_tools/aapt2" link -I "$platform" --manifest "$project/launcher/AndroidManifest.xml" \
     --min-sdk-version 34 --target-sdk-version 37 --java "$stage/generated" \
-    -A "$project/launcher/assets" -o "$stage/unsigned.apk" "$stage/resources.zip"
+    -A "$stage/assets" -o "$stage/unsigned.apk" "$stage/resources.zip"
 mapfile -d '' -t sources < <(find "$project/launcher/src" "$stage/generated" -name '*.java' -print0)
 javac --release 17 -cp "$platform" -d "$stage/classes" "${sources[@]}"
 jar --create --file "$stage/classes.jar" -C "$stage/classes" .

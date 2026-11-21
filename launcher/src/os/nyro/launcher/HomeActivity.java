@@ -23,6 +23,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
 import android.os.StatFs;
+import android.os.UserHandle;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.text.Editable;
@@ -57,6 +58,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -68,6 +73,10 @@ public final class HomeActivity extends Activity {
             "com.android.documentsui"};
     private static final String[] DOCK = {"com.android.dialer", "com.android.chrome", "com.android.vending",
             "com.android.settings"};
+    private static final Pattern ACCENTS = Pattern.compile("\\p{M}+");
+    private static final DateTimeFormatter CLOCK_24 = DateTimeFormatter.ofPattern("HH:mm", DeviceMetrics.PT_BR);
+    private static final DateTimeFormatter CLOCK_12 = DateTimeFormatter.ofPattern("h:mm", DeviceMetrics.PT_BR);
+    private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("EEEE, d 'de' MMMM", DeviceMetrics.PT_BR);
     private static final int CHOOSE_PROJECTS = 20;
     private static final int UNINSTALL_APP = 21;
     private enum Page { HOME, HUB, DRAWER }
@@ -76,7 +85,23 @@ public final class HomeActivity extends Activity {
     private final ExecutorService metricsWorker = Executors.newSingleThreadExecutor();
     private final ExecutorService projectReader = Executors.newSingleThreadExecutor();
     private final ExecutorService endpointWorker = Executors.newFixedThreadPool(3);
-    private final List<LauncherActivityInfo> installed = new ArrayList<>();
+    private final ExecutorService appWorker = Executors.newSingleThreadExecutor();
+    private List<LauncherActivityInfo> installed = List.of();
+    private Map<String, LauncherActivityInfo> appsByPackage = Map.of();
+    private Map<String, String> labels = Map.of(), searchLabels = Map.of();
+    private final Runnable refreshApps = this::loadApps;
+    private final LauncherApps.Callback appChanges = new LauncherApps.Callback() {
+        private void changed(UserHandle user) {
+            if (!Process.myUserHandle().equals(user)) return;
+            handler.removeCallbacks(refreshApps);
+            handler.postDelayed(refreshApps, 120);
+        }
+        @Override public void onPackageAdded(String packageName, UserHandle user) { changed(user); }
+        @Override public void onPackageRemoved(String packageName, UserHandle user) { changed(user); }
+        @Override public void onPackageChanged(String packageName, UserHandle user) { changed(user); }
+        @Override public void onPackagesAvailable(String[] names, UserHandle user, boolean replacing) { changed(user); }
+        @Override public void onPackagesUnavailable(String[] names, UserHandle user, boolean replacing) { changed(user); }
+    };
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             if (page == Page.HOME) updateHeader();
@@ -87,6 +112,9 @@ public final class HomeActivity extends Activity {
 
     private SharedPreferences preferences;
     private LauncherApps launcher;
+    private LauncherIcons icons;
+    private int appsGeneration;
+    private View homePage, drawerPage;
     private Visuals.Wallpaper wallpaper;
     private FrameLayout content;
     private Page page = Page.HOME;
@@ -108,6 +136,8 @@ public final class HomeActivity extends Activity {
         super.onCreate(state);
         preferences = getSharedPreferences("launcher", MODE_PRIVATE);
         launcher = getSystemService(LauncherApps.class);
+        icons = new LauncherIcons(handler, d(48));
+        launcher.registerCallback(appChanges, handler);
         getWindow().setDecorFitsSystemWindows(false);
         getWindow().setNavigationBarContrastEnforced(false);
 
@@ -131,8 +161,6 @@ public final class HomeActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
-        loadApps();
-        if (page == Page.DRAWER) filterDrawer();
         if (page == Page.HUB) reloadProjects(false);
         handler.removeCallbacks(tick);
         tick.run();
@@ -144,6 +172,9 @@ public final class HomeActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        launcher.unregisterCallback(appChanges);
+        appWorker.shutdownNow();
+        icons.close();
         handler.removeCallbacksAndMessages(null);
         metricsWorker.shutdownNow();
         projectReader.shutdownNow();
@@ -198,21 +229,36 @@ public final class HomeActivity extends Activity {
         hideKeyboard();
         page = next;
         projectsGeneration++;
+        if (content.getChildCount() != 0) content.getChildAt(0).animate().cancel();
         content.removeAllViews();
         wallpaper.showHome(page == Page.HOME);
         View view = switch (page) {
-            case HOME -> home();
+            case HOME -> {
+                if (homePage == null || !animate) homePage = home();
+                updateHeader();
+                yield homePage;
+            }
             case HUB -> hub();
-            case DRAWER -> drawer();
+            case DRAWER -> {
+                if (drawerPage == null) drawerPage = drawer();
+                else {
+                    if (drawerQuery.length() > 0) drawerQuery.setText("");
+                    drawerGrid.setSelection(0);
+                }
+                yield drawerPage;
+            }
         };
         content.addView(view, new FrameLayout.LayoutParams(-1, -1));
         content.requestFocus();
+        view.setTranslationX(0);
+        view.setTranslationY(0);
         if (animate) {
-            view.setAlpha(.65f);
-            if (next == Page.DRAWER) view.setTranslationY(d(36));
-            else if (next == Page.HUB || previous == Page.HUB)
-                view.setTranslationX(d(next == Page.HUB ? -34 : 34));
-            view.animate().alpha(1).translationX(0).translationY(0).setDuration(210).start();
+            if (next == Page.DRAWER || previous == Page.DRAWER) {
+                view.setTranslationY(d(next == Page.DRAWER ? 32 : -18));
+            } else if (next == Page.HUB || previous == Page.HUB) {
+                view.setTranslationX(d(next == Page.HUB ? -32 : 32));
+            }
+            view.animate().translationX(0).translationY(0).setDuration(165).start();
         }
         Log.i(TAG, "Página " + page);
     }
@@ -280,7 +326,7 @@ public final class HomeActivity extends Activity {
         search.setPadding(d(10), 0, d(14), 0);
         search.setBackground(surface(this, 0xe6242031, 25, 0xff4b3d60));
         LauncherActivityInfo google = app(GOOGLE);
-        View icon = google == null ? glyph("search", ACCENT, 20) : image(google.getIcon(0));
+        View icon = google == null ? glyph("search", ACCENT, 20) : appIcon(google);
         search.addView(icon, size(36, 50));
         icon.setContentDescription("Abrir app Google");
         icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
@@ -315,20 +361,19 @@ public final class HomeActivity extends Activity {
         if (clock == null || page != Page.HOME) return;
         LocalDateTime now = LocalDateTime.now();
         int hour = now.getHour();
-        greeting.setText(hour < 12 ? "Bom dia" : hour < 18 ? "Boa tarde" : "Boa noite");
-        clock.setText(now.format(DateTimeFormatter.ofPattern(DateFormat.is24HourFormat(this) ? "HH:mm" : "h:mm",
-                DeviceMetrics.PT_BR)));
-        String today = now.format(DateTimeFormatter.ofPattern("EEEE, d 'de' MMMM", DeviceMetrics.PT_BR));
-        date.setText(Character.toUpperCase(today.charAt(0)) + today.substring(1));
+        setTextIfChanged(greeting, hour < 12 ? "Bom dia" : hour < 18 ? "Boa tarde" : "Boa noite");
+        setTextIfChanged(clock, now.format(DateFormat.is24HourFormat(this) ? CLOCK_24 : CLOCK_12));
+        String today = now.format(DATE);
+        setTextIfChanged(date, Character.toUpperCase(today.charAt(0)) + today.substring(1));
         int percent = getSystemService(BatteryManager.class).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
-        battery.setText(percent >= 0 && percent <= 100 ? percent + "%" : "—");
+        setTextIfChanged(battery, percent >= 0 && percent <= 100 ? percent + "%" : "—");
     }
 
     private LinearLayout slots(String prefix, String[] defaults, boolean dock) {
         LinearLayout line = row();
         for (int index = 0; index < defaults.length; index++) {
             int slot = index;
-            LauncherActivityInfo item = app(preferences.getString(prefix + index, defaults[index]));
+            LauncherActivityInfo item = slotApp(prefix + index, defaults[index]);
             View tile = appTile(item, dock ? "dock" : "favorite", () -> launch(item),
                     () -> slotMenu(prefix, slot, item));
             LinearLayout.LayoutParams cell = new LinearLayout.LayoutParams(0, -1, 1);
@@ -348,7 +393,7 @@ public final class HomeActivity extends Activity {
         int tileSize = favorite ? 48 : dock ? 38 : 48;
         FrameLayout box = new FrameLayout(this);
         if (!dock) box.setBackground(surface(this, favorite ? 0xff242236 : CARD, 16, Color.TRANSPARENT));
-        View icon = item == null ? glyph("grid", MUTED, 24) : image(item.getIcon(0));
+        View icon = item == null ? glyph("grid", MUTED, 24) : appIcon(item);
         box.addView(icon, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         tile.addView(box, size(tileSize, tileSize));
         String title = item == null ? "Selecionar" : appLabel(item);
@@ -489,27 +534,39 @@ public final class HomeActivity extends Activity {
     }
 
     private void updateMetrics() {
-        if (page != Page.HUB || ramValue == null) return;
-        ActivityManager.MemoryInfo memory = DeviceMetrics.memory(this);
-        long used = memory.totalMem - memory.availMem;
-        int ramPercent = percent(used, memory.totalMem);
-        ramValue.setText(ramPercent + "%");
-        ramDetail.setText(DeviceMetrics.gib(used) + " de " + DeviceMetrics.gib(memory.totalMem));
-        ramBar.setProgress(ramPercent, true);
-        StatFs disk = DeviceMetrics.storage();
-        storageValue.setText(DeviceMetrics.gib(disk.getAvailableBytes()));
-        storageDetail.setText("livres de " + DeviceMetrics.gib(disk.getTotalBytes()));
-        storageBar.setProgress(percent(disk.getTotalBytes() - disk.getAvailableBytes(), disk.getTotalBytes()), true);
-        ipValue.setText(DeviceMetrics.address(this));
-        if (cpuPending) return;
+        if (page != Page.HUB || ramValue == null || cpuPending) return;
         cpuPending = true;
-        TextView output = cpuValue;
+        TextView destination = cpuValue;
         metricsWorker.execute(() -> {
-            String value = DeviceMetrics.cpu();
-            handler.post(() -> {
-                cpuPending = false;
-                if (page == Page.HUB && cpuValue == output) output.setText(value);
-            });
+            try {
+                ActivityManager.MemoryInfo memory = DeviceMetrics.memory(this);
+                StatFs disk = DeviceMetrics.storage();
+                long used = memory.totalMem - memory.availMem;
+                long free = disk.getAvailableBytes();
+                long total = disk.getTotalBytes();
+                String address = DeviceMetrics.address(this);
+                handler.post(() -> {
+                    if (page != Page.HUB || cpuValue != destination || isDestroyed()) return;
+                    int ramPercent = percent(used, memory.totalMem);
+                    setTextIfChanged(ramValue, ramPercent + "%");
+                    setTextIfChanged(ramDetail, DeviceMetrics.gib(used) + " de " + DeviceMetrics.gib(memory.totalMem));
+                    ramBar.setProgress(ramPercent, true);
+                    setTextIfChanged(storageValue, DeviceMetrics.gib(free));
+                    setTextIfChanged(storageDetail, "livres de " + DeviceMetrics.gib(total));
+                    storageBar.setProgress(percent(total - free, total), true);
+                    setTextIfChanged(ipValue, address);
+                });
+                String cpu = DeviceMetrics.cpu();
+                handler.post(() -> {
+                    if (page == Page.HUB && cpuValue == destination && !isDestroyed()) {
+                        setTextIfChanged(destination, cpu);
+                    }
+                });
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Métricas indisponíveis", error);
+            } finally {
+                handler.post(() -> cpuPending = false);
+            }
         });
     }
 
@@ -534,7 +591,6 @@ public final class HomeActivity extends Activity {
         super.onActivityResult(request, result, data);
         if (request == UNINSTALL_APP) {
             loadApps();
-            if (page == Page.DRAWER) filterDrawer();
             return;
         }
         if (request != CHOOSE_PROJECTS || result != RESULT_OK || data == null || data.getData() == null) return;
@@ -696,9 +752,11 @@ public final class HomeActivity extends Activity {
         Set<String> hidden = hidden();
         drawerAdapter.items.clear();
         for (LauncherActivityInfo item : installed) {
-            if (hidden.contains(item.getApplicationInfo().packageName)) continue;
-            if (fold(appLabel(item)).contains(query)
-                    || fold(item.getApplicationInfo().packageName).contains(query)) drawerAdapter.items.add(item);
+            String packageName = item.getComponentName().getPackageName();
+            if (hidden.contains(packageName)) continue;
+            if (query.isEmpty() || searchLabels.getOrDefault(packageName, "").contains(query)) {
+                drawerAdapter.items.add(item);
+            }
         }
         drawerAdapter.notifyDataSetChanged();
         noApps.setVisibility(drawerAdapter.items.isEmpty() ? View.VISIBLE : View.GONE);
@@ -711,10 +769,46 @@ public final class HomeActivity extends Activity {
         @Override public LauncherActivityInfo getItem(int position) { return items.get(position); }
         @Override public long getItemId(int position) { return position; }
         @Override public View getView(int position, View recycled, ViewGroup parent) {
-            LauncherActivityInfo item = getItem(position);
-            View tile = appTile(item, "drawer", () -> launch(item), () -> appMenu(item));
-            tile.setLayoutParams(new android.widget.AbsListView.LayoutParams(-1, d(87)));
+            DrawerTile tile = recycled instanceof DrawerTile existing ? existing : new DrawerTile();
+            tile.bind(getItem(position));
             return tile;
+        }
+    }
+
+    private final class DrawerTile extends LinearLayout {
+        private final ImageView icon;
+        private final TextView title;
+        private LauncherActivityInfo item;
+
+        DrawerTile() {
+            super(HomeActivity.this);
+            setLayoutParams(new android.widget.AbsListView.LayoutParams(-1, d(87)));
+            setOrientation(VERTICAL);
+            setGravity(Gravity.CENTER);
+            setPadding(d(2), d(3), d(2), d(3));
+            setBackground(pressable(HomeActivity.this, Color.TRANSPARENT, 18, Color.TRANSPARENT));
+            FrameLayout box = new FrameLayout(HomeActivity.this);
+            box.setBackground(surface(HomeActivity.this, CARD, 16, Color.TRANSPARENT));
+            icon = image(null);
+            box.addView(icon, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+            addView(box, size(48, 48));
+            title = label("", 11.5f, TEXT, "sans-serif-medium");
+            title.setGravity(Gravity.CENTER);
+            title.setMaxLines(1);
+            title.setEllipsize(TextUtils.TruncateAt.END);
+            var textSize = size(-1, 22);
+            textSize.topMargin = d(4);
+            addView(title, textSize);
+            setOnClickListener(view -> launch(item));
+            setOnLongClickListener(view -> { appMenu(item); return true; });
+        }
+
+        void bind(LauncherActivityInfo app) {
+            item = app;
+            String name = appLabel(app);
+            setTextIfChanged(title, name);
+            setContentDescription(name);
+            icons.bind(icon, app);
         }
     }
 
@@ -792,7 +886,7 @@ public final class HomeActivity extends Activity {
     private void chooseSlot(LauncherActivityInfo item) {
         String[] names = new String[FAVORITES.length];
         for (int index = 0; index < names.length; index++) {
-            LauncherActivityInfo current = app(preferences.getString("favorite" + index, FAVORITES[index]));
+            LauncherActivityInfo current = slotApp("favorite" + index, FAVORITES[index]);
             names[index] = (index + 1) + " · " + (current == null ? "Livre" : appLabel(current));
         }
         new AlertDialog.Builder(this).setTitle("Substituir favorito")
@@ -803,35 +897,75 @@ public final class HomeActivity extends Activity {
     }
 
     private void loadApps() {
-        var byPackage = new java.util.LinkedHashMap<String, LauncherActivityInfo>();
-        for (LauncherActivityInfo item : launcher.getActivityList(null, Process.myUserHandle())) {
-            String packageName = item.getApplicationInfo().packageName;
-            if (packageName.equals(getPackageName()) || packageName.equals("com.android.launcher3")) continue;
-            if (packageName.equals(GOOGLE) && item.getComponentName().getShortClassName().equals(".SearchActivity")) {
-                byPackage.put(packageName, item);
-            } else {
-                byPackage.putIfAbsent(packageName, item);
+        int generation = ++appsGeneration;
+        appWorker.execute(() -> {
+            try {
+                Map<String, LauncherActivityInfo> byPackage = new LinkedHashMap<>();
+                for (LauncherActivityInfo item : launcher.getActivityList(null, Process.myUserHandle())) {
+                    ComponentName component = item.getComponentName();
+                    String name = component.getPackageName();
+                    if (name.equals(getPackageName()) || name.equals("com.android.launcher3")) continue;
+                    if (name.equals(GOOGLE) && component.getShortClassName().equals(".SearchActivity")) {
+                        byPackage.put(name, item);
+                    } else {
+                        byPackage.putIfAbsent(name, item);
+                    }
+                }
+                Map<String, String> names = new HashMap<>();
+                Map<String, String> search = new HashMap<>();
+                byPackage.forEach((pkg, item) -> {
+                    String label = fetchAppLabel(item);
+                    names.put(pkg, label);
+                    search.put(pkg, fold(label) + "\n" + fold(pkg));
+                });
+                List<LauncherActivityInfo> items = new ArrayList<>(byPackage.values());
+                Collator order = Collator.getInstance(DeviceMetrics.PT_BR);
+                items.sort((first, second) -> order.compare(names.get(first.getComponentName().getPackageName()),
+                        names.get(second.getComponentName().getPackageName())));
+                handler.post(() -> {
+                    if (generation != appsGeneration || isDestroyed()) return;
+                    installed = items;
+                    appsByPackage = byPackage;
+                    labels = names;
+                    searchLabels = search;
+                    icons.clear();
+                    homePage = null;
+                    if (drawerPage != null) filterDrawer();
+                    if (page == Page.HOME) show(Page.HOME, false);
+                });
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Não foi possível atualizar a lista de apps", error);
             }
-        }
-        installed.clear();
-        installed.addAll(byPackage.values());
-        Collator order = Collator.getInstance(DeviceMetrics.PT_BR);
-        installed.sort((first, second) -> order.compare(appLabel(first), appLabel(second)));
+        });
     }
 
     private LauncherActivityInfo app(String packageName) {
-        for (LauncherActivityInfo item : installed) {
-            if (item.getApplicationInfo().packageName.equals(packageName)) return item;
-        }
-        return null;
+        return appsByPackage.get(packageName);
+    }
+
+    private LauncherActivityInfo slotApp(String key, String defaultPackage) {
+        if (preferences.contains(key)) return app(preferences.getString(key, ""));
+        LauncherActivityInfo preferred = app(defaultPackage);
+        if (preferred != null) return preferred;
+        return switch (defaultPackage) {
+            case "com.android.dialer" -> app("com.samsung.android.dialer");
+            case "com.android.camera2" -> app("com.sec.android.app.camera");
+            case "com.android.gallery3d" -> app("com.sec.android.gallery3d");
+            case "com.android.documentsui" -> app("com.sec.android.app.myfiles");
+            default -> null;
+        };
     }
 
     private String appLabel(LauncherActivityInfo item) {
-        return switch (item.getApplicationInfo().packageName) {
-            case "com.android.dialer" -> "Telefone";
-            case "com.android.camera2" -> "Câmera";
-            case "com.android.gallery3d" -> "Galeria";
-            case "com.android.documentsui" -> "Arquivos";
+        return labels.getOrDefault(item.getComponentName().getPackageName(), item.getComponentName().getPackageName());
+    }
+
+    private String fetchAppLabel(LauncherActivityInfo item) {
+        return switch (item.getComponentName().getPackageName()) {
+            case "com.android.dialer", "com.samsung.android.dialer" -> "Telefone";
+            case "com.android.camera2", "com.sec.android.app.camera" -> "Câmera";
+            case "com.android.gallery3d", "com.sec.android.gallery3d" -> "Galeria";
+            case "com.android.documentsui", "com.sec.android.app.myfiles" -> "Arquivos";
             case "com.android.settings" -> "Configurações";
             case "com.android.contacts" -> "Contatos";
             case "com.android.deskclock" -> "Relógio";
@@ -872,8 +1006,8 @@ public final class HomeActivity extends Activity {
     }
 
     private String fold(String value) {
-        return Normalizer.normalize(value, Normalizer.Form.NFD).replaceAll("\\p{M}+", "")
-                .toLowerCase(DeviceMetrics.PT_BR);
+        return ACCENTS.matcher(Normalizer.normalize(value, Normalizer.Form.NFD))
+                .replaceAll("").toLowerCase(DeviceMetrics.PT_BR);
     }
 
     private void open(Intent intent) {
@@ -886,7 +1020,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void hideKeyboard() {
-        if (content == null) return;
+        if (content == null || !(getCurrentFocus() instanceof EditText)) return;
         getSystemService(InputMethodManager.class).hideSoftInputFromWindow(content.getWindowToken(), 0);
         content.requestFocus();
     }
@@ -946,6 +1080,16 @@ public final class HomeActivity extends Activity {
         label.setTypeface(Typeface.create(font, Typeface.NORMAL));
         label.setGravity(Gravity.CENTER_VERTICAL);
         return label;
+    }
+
+    private void setTextIfChanged(TextView view, CharSequence value) {
+        if (!TextUtils.equals(view.getText(), value)) view.setText(value);
+    }
+
+    private ImageView appIcon(LauncherActivityInfo item) {
+        ImageView view = image(null);
+        icons.bind(view, item);
+        return view;
     }
 
     private ImageView image(Drawable source) {

@@ -82,8 +82,13 @@ payload="$project/custom/priv-app/NyRoCore"
 apk_key="$ANDROID_USER_HOME/nyrocore.p12"
 export JDK_JAVA_OPTIONS="-XX:+PerfDisableSharedMem \"-Djava.io.tmpdir=$TMPDIR\""
 mkdir -p "$stage/assets" "$stage/dex" "$stage/generated" "$stage/classes" "$payload"
+shizuku="$project/.tools/shizuku"
+bash "$project/scripts/setup_shizuku.sh" --sdk-only
+libraries=("$shizuku"/api.jar "$shizuku"/provider.jar "$shizuku"/shared.jar "$shizuku"/aidl.jar)
+classpath=$(IFS=:; printf '%s' "${libraries[*]}")
 
 install -m 0644 "$project/ota/catalog-public.der" "$stage/assets/ota_public.der"
+install -m 0644 "$project/core/LICENSE-Shizuku-API.txt" "$stage/assets/LICENSE-Shizuku-API.txt"
 python3 -I -B "$project/ota/package_release.py" --feed-url > "$stage/assets/ota_feed.txt"
 if [[ ! -s $apk_key ]]; then
     (umask 077; keytool -genkeypair -keystore "$apk_key" -storetype PKCS12 -storepass android \
@@ -96,9 +101,9 @@ printf 'Compilando NyRoCore com AAPT2, javac e D8.\n'
     --min-sdk-version 34 --target-sdk-version 37 --java "$stage/generated" \
     -A "$stage/assets" -o "$stage/unsigned.apk" "$stage/res.zip"
 mapfile -d '' -t sources < <(find "$project/core/src" "$stage/generated" -name '*.java' -print0)
-javac --release 17 -cp "$platform" -d "$stage/classes" "${sources[@]}"
+javac --release 17 -cp "$platform:$classpath" -d "$stage/classes" "${sources[@]}"
 jar --create --file "$stage/classes.jar" -C "$stage/classes" .
-"$sdk/d8" --release --min-api 34 --lib "$platform" --output "$stage/dex" "$stage/classes.jar"
+"$sdk/d8" --release --min-api 34 --lib "$platform" --output "$stage/dex" "$stage/classes.jar" "${libraries[@]}"
 (cd "$stage/dex" && zip -q "$stage/unsigned.apk" classes.dex)
 "$sdk/zipalign" -f 4 "$stage/unsigned.apk" "$stage/aligned.apk"
 "$sdk/apksigner" sign --ks "$apk_key" --ks-key-alias nyrocore --ks-pass pass:android \

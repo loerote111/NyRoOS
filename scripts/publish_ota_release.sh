@@ -5,7 +5,7 @@ cd -- "$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source ./env.sh
 
 if [[ ${1-} == --help || ${1-} == -h || $# == 0 ]]; then
-    printf 'Uso: %s --version X.Y.Z --notes CHANGELOG [--ota OTA.zip] [--replace] [--build-apks]\n' "$0"
+    printf 'Uso: %s --version X.Y.Z --notes CHANGELOG [--ota OTA.zip] [--replace] [--build-apks] [--raw-assets]\n' "$0"
     exit 0
 fi
 
